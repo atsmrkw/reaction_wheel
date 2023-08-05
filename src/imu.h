@@ -37,9 +37,9 @@ class IMU {
    * @param gy
    * @param gz
    */
-  void GetData(int16_t* ax, int16_t* ay, int16_t* az, int16_t* gx, int16_t* gy,
-               int16_t* gz);
+  void GetData(float& ax, float& ay, float& az, float& gx, float& gy,
+               float& gz);
 
  private:
-  MPU6050 mpu6050_;  //!< MPU6050
+  MPU6050 mpu6050_;  // MPU6050
 };
