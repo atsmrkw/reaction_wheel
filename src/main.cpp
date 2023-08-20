@@ -1,57 +1,105 @@
 #include <Arduino.h>
 
+#include "constants.h"
 #include "imu.h"
 #include "motor.h"
 #include "pin.h"
 
+/**
+ * State
+ */
+enum class State { Idle, BalancingOnEdge, BalancingAtCorner };
+
 constexpr int SERIAL_BAUD_RATE = 115200;  // Baud rate of serial comm [bps]
 
-constexpr int PWM_CH_X = 0;  // PWM channel of X motor
-constexpr int PWM_CH_Y = 1;  // PWM channel of Y motor
-constexpr int PWM_CH_Z = 2;  // PWM channel of Z motor
+constexpr int PWM_CH_X = 0;               // PWM channel of X motor
+constexpr int PWM_CH_Y = 1;               // PWM channel of Y motor
+constexpr int PWM_CH_Z = 2;               // PWM channel of Z motor
 
-constexpr int CYCLE_TIME = 10;  // Loop cycle time [ms]
+constexpr int CYCLE_TIME = 10;            // Loop cycle time [ms]
 
-static const float INST_ANGLE =
-  -atan(2.0 / sqrt(2.0));  // IMU installation angle
+constexpr float INIT_KP = -12300.0;       // Initial value of Kp
+constexpr float INIT_KD = -387.2;         // Initial value of Kd
+constexpr float INIT_KW = 0.30;           // Initial value of Kw
 
-Motor motor_x_(Motor::Axis::X, pin::MOT_X_DIR, pin::MOT_X_PWM,
-               PWM_CH_X);  // X motor
-Motor motor_y_(Motor::Axis::Y, pin::MOT_Y_DIR, pin::MOT_Y_PWM,
-               PWM_CH_Y);  // Y motor
-Motor motor_z_(Motor::Axis::Z, pin::MOT_Z_DIR, pin::MOT_Z_PWM,
-               PWM_CH_Z);  // Z motor
+State state = State::Idle;                // State
 
-IMU imu_;  // IMU
-Quaternion IMU_ROT(cos(INST_ANGLE / 2), -1 / sqrt(2.0) * sin(INST_ANGLE / 2),
-                   1 / sqrt(2.0) * sin(INST_ANGLE / 2), 0);
+// Motors
+std::array<Motor, AXIS_NUM> motors_ = {
+  Motor(Axis::X, pin::MOT_X_DIR, pin::MOT_X_PWM, PWM_CH_X),
+  Motor(Axis::Y, pin::MOT_Y_DIR, pin::MOT_Y_PWM, PWM_CH_Y),
+  Motor(Axis::Z, pin::MOT_Z_DIR, pin::MOT_Z_PWM, PWM_CH_Z)};
+
+IMU imu_;                      // IMU
 
 unsigned long time_ = 0;       // Current time [ms]
 unsigned long prev_time_ = 0;  // Time of previous cycle [ms]
 unsigned long count_ = 0;      // Cycle count
 
-VectorFloat accel_(0.0, 0.0, 0.0);         // Acceleration vector
-VectorFloat gyro_(0.0, 0.0, 0.0);          // Gyro data
-VectorFloat tgt_pose_(0.58, 0.56, -0.58);  // Target pose
-VectorFloat speed_(0.0, 0.0, 0.0);         // Motor speed
+std::array<float, AXIS_NUM> accel_ = {0.0, 0.0, 0.0};  // Acceleration [G]
+std::array<float, AXIS_NUM> gyro_ = {0.0, 0.0, 0.0};   // Gyro [rad/sec]
+// VectorFloat tgt_pose_(0.58, 0.56, -0.58);  // Target pose
+std::array<float, AXIS_NUM> tgt_pose_ = {0.0, -0.73, -0.66};  // Target pose [G]
+std::array<int, AXIS_NUM> torque_ = {0, 0, 0};  // Motor torque @todo unit?
+
+// Angular difference [rad]
+std::array<float, AXIS_NUM> ang_diff_ = {PI / 4, PI / 4, PI / 4};
+// Previous angular difference [rad]
+std::array<float, AXIS_NUM> prev_ang_diff_ = {0.0, 0.0, 0.0};
+// Estimated angle ofset [rad]
+std::array<float, AXIS_NUM> est_ang_ofst_ = {0.0, 0.0, 0.0};
 
 // Gain
-float kp_x_ = 500.0;  // Proportional gain
-float kp_y_ = 500.0;  // Proportional gain
-float kp_z_ = 500.0;  // Proportional gain
-float kd_x_ = 20.0;   // Differential gain
-float kd_y_ = 20.0;   // Differential gain
-float kd_z_ = 20.0;   // Differential gain
-float kw_x_ = 0.0;    // Integral gain
-float kw_y_ = 0.0;    // Integral gain
-float kw_z_ = 0.0;    // Integral gain
-float kp2_x_ = 0.0;
-float kp2_y_ = 0.0;
-float kp2_z_ = 0.0;
+// Proportional gain
+std::array<float, AXIS_NUM> kp_ = {INIT_KP, INIT_KP, INIT_KP};
+// Differential gain
+std::array<float, AXIS_NUM> kd_ = {INIT_KD, INIT_KD, INIT_KD};
+// Integral gain
+std::array<float, AXIS_NUM> kw_ = {INIT_KW, INIT_KW, INIT_KW};
+std::array<float, AXIS_NUM> kp2_ = {0.0, 0.0, 0.0};
 
-VectorFloat mot_ang_vel_(0.0, 0.0,
-                         0.0);  // Motor angular velocity @todo local val
-VectorFloat mot_ang_vel_i_(0.0, 0.0, 0.0);
+// Motor angular velocity [rad/s]
+std::array<float, AXIS_NUM> mot_ang_vel_ = {0.0, 0.0, 0.0};
+
+/**
+ * @brief Calculate angular difference using complementary filter
+ * @param prev_ang_diff Previous angular difference [rad]
+ * @param ang_diff_accel Angular difference calculated from acceleration sensor
+ * [rad]
+ * @param ang_vel Angular velocity aquired from gyro sensor [rad/s]
+ * @return Angular difference [rad]
+ */
+float CalculateAngularDifference(float prev_ang_diff, float ang_diff_accel,
+                                 float ang_vel);
+
+/**
+ * @brief Get motor angular velocity
+ * @param enc_val Encoder value
+ * @return Angular velocity [rad/s]
+ */
+float GetMotorAngularVelocity(int8_t enc_val);
+
+/**
+ * @brief Processing in Idle state
+ */
+void Idle();
+
+/**
+ * @brief Processing in BalancingOnEdge state
+ */
+void BalanceOnEdge();
+
+/**
+ * @brief Update feedback gain
+ * @details Read characters from serial port.
+ */
+void UpdateFeedbackGain();
+
+/**
+ * @brief Plot parameters with Teleplot
+ * @note VSCode extension Teleplot must be installed.
+ */
+void PlotWithTeleplot();
 
 void setup() {
   Serial.begin(SERIAL_BAUD_RATE);
@@ -85,155 +133,196 @@ void loop() {
   time_ = millis();
 
   if (time_ - prev_time_ >= CYCLE_TIME) {
-    VectorFloat tmp_accel;
-    VectorFloat tmp_gyro;
+    std::array<float, AXIS_NUM> tmp_accel = {0.0, 0.0, 0.0};
+    std::array<float, AXIS_NUM> tmp_gyro = {0.0, 0.0, 0.0};
 
     // Get input data
-    imu_.GetData(tmp_accel.x, tmp_accel.y, tmp_accel.z, tmp_gyro.x, tmp_gyro.y,
-                 tmp_gyro.z);
-    tmp_accel.rotate(&IMU_ROT);
-    tmp_gyro.rotate(&IMU_ROT);
+    imu_.GetData(tmp_accel[Axis::X], tmp_accel[Axis::Y], tmp_accel[Axis::Z],
+                 tmp_gyro[Axis::X], tmp_gyro[Axis::Y], tmp_gyro[Axis::Z]);
 
-    constexpr float ALPHA_ACCEL = 0.5;
-    constexpr float ALPHA_GYRO = 0.5;
-    accel_.x = (1.0 - ALPHA_ACCEL) * accel_.x + ALPHA_ACCEL * tmp_accel.x;
-    accel_.y = (1.0 - ALPHA_ACCEL) * accel_.y + ALPHA_ACCEL * tmp_accel.y;
-    accel_.z = (1.0 - ALPHA_ACCEL) * accel_.z + ALPHA_ACCEL * tmp_accel.z;
-    gyro_.x = (1.0 - ALPHA_GYRO) * gyro_.x + ALPHA_GYRO * tmp_gyro.x;
-    gyro_.y = (1.0 - ALPHA_GYRO) * gyro_.y + ALPHA_GYRO * tmp_gyro.y;
-    gyro_.z = (1.0 - ALPHA_GYRO) * gyro_.z + ALPHA_GYRO * tmp_gyro.z;
+    constexpr float ALPHA_ACCEL = 0.8;
+    constexpr float ALPHA_GYRO = 1.0;
+    for (int i = 0; i < AXIS_NUM; i++) {
+      accel_[i] = (1.0 - ALPHA_ACCEL) * accel_[i] + ALPHA_ACCEL * tmp_accel[i];
+      gyro_[i] = (1.0 - ALPHA_GYRO) * gyro_[i] + ALPHA_GYRO * tmp_gyro[i];
+    }
 
-    float ang_diff_x =
-      -std::atan2(tgt_pose_.y * accel_.z - tgt_pose_.z * accel_.y,
-                  tgt_pose_.y * accel_.y + tgt_pose_.z * accel_.z);
-    float ang_diff_y =
-      -std::atan2((-tgt_pose_.x) * accel_.z - tgt_pose_.z * (-accel_.x),
-                  (-tgt_pose_.x) * (-accel_.x) + tgt_pose_.z * accel_.z);
-    float ang_diff_z =
-      -std::atan2(tgt_pose_.x * accel_.y - tgt_pose_.y * accel_.x,
-                  tgt_pose_.x * accel_.x + tgt_pose_.y * accel_.y);
+    std::array<float, AXIS_NUM> ang_diff_accel = {
+      -std::atan2(tgt_pose_[Axis::Y] * accel_[Axis::Z] -
+                    tgt_pose_[Axis::Z] * accel_[Axis::Y],
+                  tgt_pose_[Axis::Y] * accel_[Axis::Y] +
+                    tgt_pose_[Axis::Z] * accel_[Axis::Z]),
+      -std::atan2((-tgt_pose_[Axis::X]) * accel_[Axis::Z] -
+                    tgt_pose_[Axis::Z] * (-accel_[Axis::X]),
+                  (-tgt_pose_[Axis::X]) * (-accel_[Axis::X]) +
+                    tgt_pose_[Axis::Z] * accel_[Axis::Z]),
+      -std::atan2(tgt_pose_[Axis::X] * accel_[Axis::Y] -
+                    tgt_pose_[Axis::Y] * accel_[Axis::X],
+                  tgt_pose_[Axis::X] * accel_[Axis::X] +
+                    tgt_pose_[Axis::Y] * accel_[Axis::Y])};
 
-    // mot_ang_vel_.x += 0.01 * motor_x_.ReadEncoder();
-    // mot_ang_vel_.y += 0.01 * motor_y_.ReadEncoder();
-    // mot_ang_vel_.z += 0.01 * motor_z_.ReadEncoder();
-    mot_ang_vel_.x = motor_x_.ReadEncoder();  // @todo anguler velocity
-    mot_ang_vel_.y = motor_y_.ReadEncoder();  // @todo anguler velocity
-    mot_ang_vel_.z = motor_z_.ReadEncoder();  // @todo anguler velocity
+    for (int i = 0; i < AXIS_NUM; i++) {
+      ang_diff_[i] = CalculateAngularDifference(prev_ang_diff_[i],
+                                                ang_diff_accel[i], gyro_[i]);
+      prev_ang_diff_[i] = ang_diff_[i];
+      mot_ang_vel_[i] = GetMotorAngularVelocity(motors_[i].ReadEncoder());
+    }
 
-    // Calculate motor speed
-    if ((fabs(ang_diff_x) < 15.0 * DEG_TO_RAD) &&
-        (fabs(ang_diff_y) < 15.0 * DEG_TO_RAD) &&
-        (fabs(ang_diff_z) < 15.0 * DEG_TO_RAD)) {
-      VectorFloat tmp_speed(
-        constrain(-kp_x_ * (ang_diff_x + kp2_x_ * mot_ang_vel_i_.x) -
-                    kd_x_ * gyro_.x + kw_x_ * mot_ang_vel_.x,
-                  -255, 255),
-        constrain(-kp_y_ * (ang_diff_y + kp2_y_ * mot_ang_vel_i_.y) -
-                    kd_y_ * gyro_.y + kw_y_ * mot_ang_vel_.y,
-                  -255, 255),
-        constrain(kp_z_ * (ang_diff_z - kp2_z_ * mot_ang_vel_i_.z) +
-                    kd_z_ * gyro_.z - kw_z_ * mot_ang_vel_.z,
-                  -255, 255));
-
-      static const float ALPHA_SPEED = 0.5;
-      speed_.x = (1.0 - ALPHA_SPEED) * speed_.x + ALPHA_SPEED * tmp_speed.x;
-      speed_.y = (1.0 - ALPHA_SPEED) * speed_.y + ALPHA_SPEED * tmp_speed.y;
-      speed_.z = (1.0 - ALPHA_SPEED) * speed_.z + ALPHA_SPEED * tmp_speed.z;
-
-      motor_x_.Drive(speed_.x);
-      motor_y_.Drive(speed_.y);
-      motor_z_.Drive(speed_.z);
+    if ((fabs(ang_diff_[Axis::X]) < 15.0 * DEG_TO_RAD)) {
+      state = State::BalancingOnEdge;
     } else {
-      speed_.x = 0;
-      speed_.y = 0;
-      speed_.z = 0;
-      motor_x_.Drive(0);
-      motor_y_.Drive(0);
-      motor_z_.Drive(0);
+      state = State::Idle;
     }
 
-    // Update parameters
-    mot_ang_vel_i_.x += 0.0001 * mot_ang_vel_.x;
-    mot_ang_vel_i_.y += 0.0001 * mot_ang_vel_.y;
-    mot_ang_vel_i_.z += 0.0001 * mot_ang_vel_.z;
-
-    // Output log
-    if (count_ % 200 == 0) {
-      Serial.print(time_);
-      Serial.print(":  acc: (");
-      Serial.print(accel_.x);
-      Serial.print(", ");
-      Serial.print(accel_.y);
-      Serial.print(", ");
-      Serial.print(accel_.z);
-      Serial.print(") gyro: (");
-      Serial.print(gyro_.x);
-      Serial.print(", ");
-      Serial.print(gyro_.y);
-      Serial.print(", ");
-      Serial.print(gyro_.z);
-      Serial.println(")");
-      Serial.print("spd_x: ");
-      Serial.println(speed_.x);
+    // Calculate motor torque
+    switch (state) {
+      case State::BalancingOnEdge:
+        BalanceOnEdge();
+        break;
+      case State::Idle:
+      default:
+        Idle();
+        break;
     }
 
-    if (Serial.available()) {
-      char cmd = Serial.read();
-      switch (cmd) {
-        case 'q':
-          kp_x_ += 30;
-          kp_y_ += 30;
-          kp_z_ += 30;
-          break;
-        case 'a':
-          kp_x_ -= 30;
-          kp_y_ -= 30;
-          kp_z_ -= 30;
-          break;
-        case 'w':
-          kd_x_ += 0.1;
-          kd_y_ += 0.1;
-          kd_z_ += 0.1;
-          break;
-        case 's':
-          kd_x_ -= 0.1;
-          kd_y_ -= 0.1;
-          kd_z_ -= 0.1;
-          break;
-        case 'e':
-          kw_x_ += 0.1;
-          kw_y_ += 0.1;
-          kw_z_ += 0.1;
-          break;
-        case 'd':
-          kw_x_ -= 0.1;
-          kw_y_ -= 0.1;
-          kw_z_ -= 0.1;
-          break;
-        case 'r':
-          kp2_x_ += 0.001;
-          kp2_y_ += 0.001;
-          kp2_z_ += 0.001;
-          break;
-        case 'f':
-          kp2_x_ -= 0.001;
-          kp2_y_ -= 0.001;
-          kp2_z_ -= 0.001;
-          break;
-        default:
-          break;
-      }
-      Serial.print("[rcv] kp: ");
-      Serial.print(kp_x_);
-      Serial.print(", kd: ");
-      Serial.print(kd_x_);
-      Serial.print(", kw: ");
-      Serial.print(kw_x_);
-      Serial.print(", kp2: ");
-      Serial.println(kp2_x_);
+    for (int i = 0; i < AXIS_NUM; i++) {
+      motors_[i].Drive(torque_[i]);
+    }
+
+    UpdateFeedbackGain();
+
+    if (count_ % 2 == 0) {
+      PlotWithTeleplot();
     }
 
     prev_time_ = time_;
     count_++;
   }
+}
+
+float CalculateAngularDifference(float prev_ang_diff, float ang_diff_accel,
+                                 float ang_vel) {
+  constexpr float COMP_FILT_COEF = 0.05;
+  return COMP_FILT_COEF * ang_diff_accel +
+         (1.0 - COMP_FILT_COEF) *
+           (prev_ang_diff + ang_vel * ((time_ - prev_time_) * MS_TO_S));
+}
+
+float GetMotorAngularVelocity(int8_t enc_val) {
+  return static_cast<float>(enc_val) * ENC_RES /
+         ((time_ - prev_time_) * MS_TO_S);
+}
+
+void Idle() {
+  for (int i = 0; i < AXIS_NUM; i++) {
+    est_ang_ofst_[i] = 0.0;
+    torque_[i] = 0;
+  }
+}
+
+void BalanceOnEdge() {
+  std::array<float, AXIS_NUM> tmp_torque = {
+    constrain(
+      -kp_[Axis::X] *
+          (ang_diff_[Axis::X] - kp2_[Axis::X] * est_ang_ofst_[Axis::X]) -
+        kd_[Axis::X] * gyro_[Axis::X] - kw_[Axis::X] * mot_ang_vel_[Axis::X],
+      -Motor::MAX_TORQUE, Motor::MAX_TORQUE),
+    constrain(
+      -kp_[Axis::Y] *
+          (ang_diff_[Axis::Y] - kp2_[Axis::Y] * est_ang_ofst_[Axis::Y]) -
+        kd_[Axis::Y] * gyro_[Axis::Y] - kw_[Axis::Y] * mot_ang_vel_[Axis::Y],
+      -Motor::MAX_TORQUE, Motor::MAX_TORQUE),
+    constrain(
+      kp_[Axis::Z] *
+          (ang_diff_[Axis::Z] - kp2_[Axis::Z] * est_ang_ofst_[Axis::Z]) +
+        kd_[Axis::Z] * gyro_[Axis::Z] + kw_[Axis::Z] * mot_ang_vel_[Axis::Z],
+      -Motor::MAX_TORQUE, Motor::MAX_TORQUE)};
+
+  static const float ALPHA_TORQUE = 1.0;
+  torque_[Axis::X] = static_cast<int>((1.0 - ALPHA_TORQUE) * torque_[Axis::X] +
+                                      ALPHA_TORQUE * tmp_torque[Axis::X]);
+  torque_[Axis::Y] = 0;
+  torque_[Axis::Z] = 0;
+  // torque_.y = (1.0 - ALPHA_TORQUE) * torque_.y + ALPHA_TORQUE * tmp_torque.y;
+  // torque_.z = (1.0 - ALPHA_TORQUE) * torque_.z + ALPHA_TORQUE * tmp_torque.z;
+
+  static const float ALPHA_OFST = 0.000001;
+  est_ang_ofst_[Axis::X] =
+    constrain((1.0 - ALPHA_OFST) * est_ang_ofst_[Axis::X] +
+                ALPHA_OFST * mot_ang_vel_[Axis::X],
+              -10.0 * DEG_TO_RAD, 10.0 * DEG_TO_RAD);
+  est_ang_ofst_[Axis::Y] = 0.0;
+  est_ang_ofst_[Axis::Z] = 0.0;
+}
+
+void UpdateFeedbackGain() {
+  if (Serial.available()) {
+    /**
+     * @brief Add values to all array elements
+     * @param k_array Gain array
+     * @param val Value to add
+     */
+    auto add_values_to_all = [](std::array<float, AXIS_NUM>& k_array,
+                                float val) {
+      // for (auto k : k_array) {
+      //   k += val;
+      // }
+      k_array[Axis::X] += val;
+      k_array[Axis::Y] += val;
+      k_array[Axis::Z] += val;
+    };
+
+    char cmd = Serial.read();
+    switch (cmd) {
+      case 'q':
+        add_values_to_all(kp_, 30.0);
+        break;
+      case 'a':
+        add_values_to_all(kp_, -30.0);
+        break;
+      case 'w':
+        add_values_to_all(kd_, 0.1);
+        break;
+      case 's':
+        add_values_to_all(kd_, -0.1);
+        break;
+      case 'e':
+        add_values_to_all(kw_, 0.01);
+        break;
+      case 'd':
+        add_values_to_all(kw_, -0.01);
+        break;
+      case 'r':
+        add_values_to_all(kp2_, 0.01);
+        break;
+      case 'f':
+        add_values_to_all(kp2_, -0.01);
+        break;
+      default:
+        break;
+    }
+
+    Serial.print("[rcv] kp: ");
+    Serial.print(kp_[Axis::X]);
+    Serial.print(", kd: ");
+    Serial.print(kd_[Axis::X]);
+    Serial.print(", kw: ");
+    Serial.print(kw_[Axis::X]);
+    Serial.print(", kp2: ");
+    Serial.println(kp2_[Axis::X]);
+  }
+}
+
+void PlotWithTeleplot() {
+  // Serial.println(">accel_.x:" + String(accel_.x));
+  // Serial.println(">accel_.y:" + String(accel_.y));
+  // Serial.println(">accel_.z:" + String(accel_.z));
+  Serial.println(">ang_diff_x:" + String(ang_diff_[Axis::X] * RAD_TO_DEG));
+  // Serial.println(">ang_diff_y:" + String(ang_diff_y_ * RAD_TO_DEG));
+  // Serial.println(">ang_diff_z:" + String(ang_diff_z_ * RAD_TO_DEG));
+  Serial.println(">mot_ang_vel:" + String(mot_ang_vel_[Axis::X]));
+  Serial.println(">gyro:" + String(gyro_[Axis::X]));
+  Serial.println(">torque:" + String(torque_[Axis::X]));
+  Serial.println(">est_ang_ofst:" +
+                 String(est_ang_ofst_[Axis::X] * RAD_TO_DEG));
 }

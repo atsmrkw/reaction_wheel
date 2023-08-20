@@ -2,7 +2,10 @@
 
 #include <Arduino.h>
 
+#include "constants.h"
 #include "pin.h"
+
+static const float ENC_RES = 2.0 * PI / 100;  // Encoder resolution[rad/pulse]
 
 /**
  * @brief Motor class
@@ -10,11 +13,7 @@
  */
 class Motor {
  public:
-  /**
-   * @brief Axis
-   *
-   */
-  enum class Axis { X, Y, Z };
+  static const int MAX_TORQUE = 255;
 
   /**
    * @brief Construct a new Motor object
@@ -48,9 +47,9 @@ class Motor {
 
   /**
    * @brief Drive motor
-   * @param speed Speed (-255 - 255)
+   * @param torque Torque (-255 ~ 255)
    */
-  void Drive(int speed);
+  void Drive(int torque);
 
   /**
    * @brief Read encoder

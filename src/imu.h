@@ -11,31 +11,28 @@ class IMU {
  public:
   /**
    * @brief Construct a new IMU object
-   *
    */
   IMU();
 
   /**
    * @brief Destroy the IMU object
-   *
    */
   ~IMU();
 
   /**
    * @brief Initialize IMU
-   *
    */
   void Initialize();
 
   /**
    * @brief Get the Data object
    *
-   * @param ax
-   * @param ay
-   * @param az
-   * @param gx
-   * @param gy
-   * @param gz
+   * @param ax X axis acceleration [G]
+   * @param ay Y axis acceleration [G]
+   * @param az Z axis acceleration [G]
+   * @param gx Angular velocity around X axis [rad/sec]
+   * @param gy Angular velocity around Y axis [rad/sec]
+   * @param gz Angular velocity around Z axis [rad/sec]
    */
   void GetData(float& ax, float& ay, float& az, float& gx, float& gy,
                float& gz);

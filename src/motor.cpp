@@ -35,14 +35,14 @@ void Motor::SetupEncoderInterrupt(int pin_x_enc_a, int pin_x_enc_b,
   attachInterrupt(pin_z_enc_b, UpdateRotationZ, CHANGE);
 }
 
-void Motor::Drive(int speed) {
-  if (speed >= 0) {
+void Motor::Drive(int torque) {
+  if (torque >= 0) {
     digitalWrite(pin_dir_, CW);
   } else {
     digitalWrite(pin_dir_, CCW);
-    speed *= -1;
+    torque *= -1;
   }
-  ledcWrite(pwm_ch_, speed > 255 ? 255 : 255 - speed);
+  ledcWrite(pwm_ch_, torque > MAX_TORQUE ? MAX_TORQUE : MAX_TORQUE - torque);
 }
 
 int8_t Motor::ReadEncoder() {
