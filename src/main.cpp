@@ -17,12 +17,15 @@ constexpr int PWM_CH_Y = 1;               // PWM channel of Y motor
 constexpr int PWM_CH_Z = 2;               // PWM channel of Z motor
 
 constexpr int CYCLE_TIME = 10;            // Loop cycle time [ms]
+constexpr int TIME_TO_START = 1000;       // Time to start control [ms]
 
 constexpr float INIT_KP = -12300.0;       // Initial value of Kp
-constexpr float INIT_KD = -387.2;         // Initial value of Kd
-constexpr float INIT_KW = 0.30;           // Initial value of Kw
+constexpr float INIT_KP2 = 0.1;           // Initial value of Kp2
+constexpr float INIT_KD = -420.2;         // Initial value of Kd
+constexpr float INIT_KW = 0.45;           // Initial value of Kw
 
-State state = State::Idle;                // State
+State state_ = State::Idle;               // State
+State next_state_ = State::Idle;          // Next state candidate
 
 // Motors
 std::array<Motor, AXIS_NUM> motors_ = {
@@ -30,11 +33,12 @@ std::array<Motor, AXIS_NUM> motors_ = {
   Motor(Axis::Y, pin::MOT_Y_DIR, pin::MOT_Y_PWM, PWM_CH_Y),
   Motor(Axis::Z, pin::MOT_Z_DIR, pin::MOT_Z_PWM, PWM_CH_Z)};
 
-IMU imu_;                      // IMU
+IMU imu_;                            // IMU
 
-unsigned long time_ = 0;       // Current time [ms]
-unsigned long prev_time_ = 0;  // Time of previous cycle [ms]
-unsigned long count_ = 0;      // Cycle count
+unsigned long time_ = 0;             // Current time [ms]
+unsigned long prev_time_ = 0;        // Time of previous cycle [ms]
+unsigned long time_at_sta_dec_ = 0;  // Time at control start decision [ms]
+unsigned long count_ = 0;            // Cycle count
 
 std::array<float, AXIS_NUM> accel_ = {0.0, 0.0, 0.0};  // Acceleration [G]
 std::array<float, AXIS_NUM> gyro_ = {0.0, 0.0, 0.0};   // Gyro [rad/sec]
@@ -169,13 +173,22 @@ void loop() {
     }
 
     if ((fabs(ang_diff_[Axis::X]) < 15.0 * DEG_TO_RAD)) {
-      state = State::BalancingOnEdge;
+      if (state_ == State::Idle) {
+        if (next_state_ == State::Idle) {
+          next_state_ = State::BalancingOnEdge;
+          time_at_sta_dec_ = time_;
+        } else if ((next_state_ == State::BalancingOnEdge) &&
+                   (time_ - time_at_sta_dec_ >= TIME_TO_START)) {
+          state_ = State::BalancingOnEdge;
+        }
+      }
     } else {
-      state = State::Idle;
+      state_ = State::Idle;
+      next_state_ = State::Idle;
     }
 
     // Calculate motor torque
-    switch (state) {
+    switch (state_) {
       case State::BalancingOnEdge:
         BalanceOnEdge();
         break;
