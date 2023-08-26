@@ -2,13 +2,20 @@
 
 #include "constants.h"
 #include "imu.h"
+#include "math.h"
 #include "motor.h"
 #include "pin.h"
 
 /**
  * State
  */
-enum class State { Idle, BalancingOnEdge, BalancingAtCorner };
+enum class State {
+  Idle,
+  BalancingOnEdgeX,
+  BalancingOnEdgeY,
+  BalancingOnEdgeZ,
+  BalancingAtCorner
+};
 
 constexpr int SERIAL_BAUD_RATE = 115200;  // Baud rate of serial comm [bps]
 
@@ -19,13 +26,20 @@ constexpr int PWM_CH_Z = 2;               // PWM channel of Z motor
 constexpr int CYCLE_TIME = 10;            // Loop cycle time [ms]
 constexpr int TIME_TO_START = 1000;       // Time to start control [ms]
 
-constexpr float INIT_KP = -12300.0;       // Initial value of Kp
+constexpr float INIT_KP = -12990.0;       // Initial value of Kp
 constexpr float INIT_KP2 = 0.1;           // Initial value of Kp2
-constexpr float INIT_KD = -420.2;         // Initial value of Kd
-constexpr float INIT_KW = 0.45;           // Initial value of Kw
+constexpr float INIT_KD = -488.6;         // Initial value of Kd
+constexpr float INIT_KW = 0.51;           // Initial value of Kw
 
-State state_ = State::Idle;               // State
-State next_state_ = State::Idle;          // Next state candidate
+// Target pose (X edge) [G]
+static const Vector3 TGT_POSE_X = {0.0, -0.73, -0.66};
+// Target pose (Y edge) [G]
+static const Vector3 TGT_POSE_Y = {-0.74, 0.0, -0.66};
+// Target pose (Z edge) [G]
+static const Vector3 TGT_POSE_Z = {-0.74, -0.67, 0.0};
+
+State state_ = State::Idle;       // State
+State next_state_ = State::Idle;  // Next state candidate
 
 // Motors
 std::array<Motor, AXIS_NUM> motors_ = {
@@ -33,37 +47,33 @@ std::array<Motor, AXIS_NUM> motors_ = {
   Motor(Axis::Y, pin::MOT_Y_DIR, pin::MOT_Y_PWM, PWM_CH_Y),
   Motor(Axis::Z, pin::MOT_Z_DIR, pin::MOT_Z_PWM, PWM_CH_Z)};
 
-IMU imu_;                            // IMU
+IMU imu_;                             // IMU
 
-unsigned long time_ = 0;             // Current time [ms]
-unsigned long prev_time_ = 0;        // Time of previous cycle [ms]
-unsigned long time_at_sta_dec_ = 0;  // Time at control start decision [ms]
-unsigned long count_ = 0;            // Cycle count
+unsigned long time_ = 0;              // Current time [ms]
+unsigned long prev_time_ = 0;         // Time of previous cycle [ms]
+unsigned long time_at_sta_dec_ = 0;   // Time at control start decision [ms]
+unsigned long count_ = 0;             // Cycle count
 
-std::array<float, AXIS_NUM> accel_ = {0.0, 0.0, 0.0};  // Acceleration [G]
-std::array<float, AXIS_NUM> gyro_ = {0.0, 0.0, 0.0};   // Gyro [rad/sec]
-// VectorFloat tgt_pose_(0.58, 0.56, -0.58);  // Target pose
-std::array<float, AXIS_NUM> tgt_pose_ = {0.0, -0.73, -0.66};  // Target pose [G]
+Vector3 accel_ = {0.0, 0.0, 0.0};     // Acceleration [G]
+Vector3 gyro_ = {0.0, 0.0, 0.0};      // Gyro [rad/sec]
+Vector3 tgt_pose_ = {0.0, 0.0, 0.0};  // Target pose [G]
 std::array<int, AXIS_NUM> torque_ = {0, 0, 0};  // Motor torque @todo unit?
 
 // Angular difference [rad]
-std::array<float, AXIS_NUM> ang_diff_ = {PI / 4, PI / 4, PI / 4};
+Vector3 ang_diff_ = {PI / 4, PI / 4, PI / 4};
 // Previous angular difference [rad]
-std::array<float, AXIS_NUM> prev_ang_diff_ = {0.0, 0.0, 0.0};
+Vector3 prev_ang_diff_ = {0.0, 0.0, 0.0};
 // Estimated angle ofset [rad]
-std::array<float, AXIS_NUM> est_ang_ofst_ = {0.0, 0.0, 0.0};
+Vector3 est_ang_ofst_ = {0.0, 0.0, 0.0};
 
 // Gain
-// Proportional gain
-std::array<float, AXIS_NUM> kp_ = {INIT_KP, INIT_KP, INIT_KP};
-// Differential gain
-std::array<float, AXIS_NUM> kd_ = {INIT_KD, INIT_KD, INIT_KD};
-// Integral gain
-std::array<float, AXIS_NUM> kw_ = {INIT_KW, INIT_KW, INIT_KW};
-std::array<float, AXIS_NUM> kp2_ = {0.0, 0.0, 0.0};
+Vector3 kp_ = {INIT_KP, INIT_KP, INIT_KP};  // Proportional gain
+Vector3 kp2_ = {INIT_KP2, INIT_KP2, INIT_KP2};
+Vector3 kd_ = {INIT_KD, INIT_KD, INIT_KD};  // Differential gain
+Vector3 kw_ = {INIT_KW, INIT_KW, INIT_KW};  // Integral gain
 
 // Motor angular velocity [rad/s]
-std::array<float, AXIS_NUM> mot_ang_vel_ = {0.0, 0.0, 0.0};
+Vector3 mot_ang_vel_ = {0.0, 0.0, 0.0};
 
 /**
  * @brief Calculate angular difference using complementary filter
@@ -90,8 +100,9 @@ void Idle();
 
 /**
  * @brief Processing in BalancingOnEdge state
+ * @param axis Balancing axis
  */
-void BalanceOnEdge();
+void BalanceOnEdge(Axis axis);
 
 /**
  * @brief Update feedback gain
@@ -137,8 +148,8 @@ void loop() {
   time_ = millis();
 
   if (time_ - prev_time_ >= CYCLE_TIME) {
-    std::array<float, AXIS_NUM> tmp_accel = {0.0, 0.0, 0.0};
-    std::array<float, AXIS_NUM> tmp_gyro = {0.0, 0.0, 0.0};
+    Vector3 tmp_accel = {0.0, 0.0, 0.0};
+    Vector3 tmp_gyro = {0.0, 0.0, 0.0};
 
     // Get input data
     imu_.GetData(tmp_accel[Axis::X], tmp_accel[Axis::Y], tmp_accel[Axis::Z],
@@ -151,36 +162,54 @@ void loop() {
       gyro_[i] = (1.0 - ALPHA_GYRO) * gyro_[i] + ALPHA_GYRO * tmp_gyro[i];
     }
 
-    std::array<float, AXIS_NUM> ang_diff_accel = {
-      -std::atan2(tgt_pose_[Axis::Y] * accel_[Axis::Z] -
-                    tgt_pose_[Axis::Z] * accel_[Axis::Y],
-                  tgt_pose_[Axis::Y] * accel_[Axis::Y] +
-                    tgt_pose_[Axis::Z] * accel_[Axis::Z]),
-      -std::atan2((-tgt_pose_[Axis::X]) * accel_[Axis::Z] -
-                    tgt_pose_[Axis::Z] * (-accel_[Axis::X]),
-                  (-tgt_pose_[Axis::X]) * (-accel_[Axis::X]) +
-                    tgt_pose_[Axis::Z] * accel_[Axis::Z]),
-      -std::atan2(tgt_pose_[Axis::X] * accel_[Axis::Y] -
-                    tgt_pose_[Axis::Y] * accel_[Axis::X],
-                  tgt_pose_[Axis::X] * accel_[Axis::X] +
-                    tgt_pose_[Axis::Y] * accel_[Axis::Y])};
-
-    for (int i = 0; i < AXIS_NUM; i++) {
-      ang_diff_[i] = CalculateAngularDifference(prev_ang_diff_[i],
-                                                ang_diff_accel[i], gyro_[i]);
-      prev_ang_diff_[i] = ang_diff_[i];
-      mot_ang_vel_[i] = GetMotorAngularVelocity(motors_[i].ReadEncoder());
-    }
-
-    if ((fabs(ang_diff_[Axis::X]) < 15.0 * DEG_TO_RAD)) {
-      if (state_ == State::Idle) {
-        if (next_state_ == State::Idle) {
-          next_state_ = State::BalancingOnEdge;
+    if (state_ == State::Idle) {
+      /**
+       * @brief Judge and transition state
+       * @param cand_state Candidate state
+       * @param tgt_pose Target pose in candidate state
+       */
+      auto judge_and_transition_state = [&](State cand_state,
+                                            Vector3 tgt_pose) {
+        if (next_state_ != cand_state) {
+          next_state_ = cand_state;
           time_at_sta_dec_ = time_;
-        } else if ((next_state_ == State::BalancingOnEdge) &&
-                   (time_ - time_at_sta_dec_ >= TIME_TO_START)) {
-          state_ = State::BalancingOnEdge;
+        } else if (time_ - time_at_sta_dec_ >= TIME_TO_START) {
+          state_ = cand_state;
+          next_state_ = State::Idle;
+          tgt_pose_ = tgt_pose;
         }
+      };
+
+      // Control start decision
+      if (GetAngle(accel_, TGT_POSE_X) < 15.0 * DEG_TO_RAD) {
+        judge_and_transition_state(State::BalancingOnEdgeX, TGT_POSE_X);
+      } else if (GetAngle(accel_, TGT_POSE_Y) < 15.0 * DEG_TO_RAD) {
+        judge_and_transition_state(State::BalancingOnEdgeY, TGT_POSE_Y);
+      } else if (GetAngle(accel_, TGT_POSE_Z) < 15.0 * DEG_TO_RAD) {
+        judge_and_transition_state(State::BalancingOnEdgeZ, TGT_POSE_Z);
+      } else {
+        next_state_ = State::Idle;
+      }
+    } else if (GetAngle(accel_, tgt_pose_) < 15.0 * DEG_TO_RAD) {
+      Vector3 ang_diff_accel = {
+        -std::atan2(tgt_pose_[Axis::Y] * accel_[Axis::Z] -
+                      tgt_pose_[Axis::Z] * accel_[Axis::Y],
+                    tgt_pose_[Axis::Y] * accel_[Axis::Y] +
+                      tgt_pose_[Axis::Z] * accel_[Axis::Z]),
+        -std::atan2(tgt_pose_[Axis::Z] * accel_[Axis::X] -
+                      tgt_pose_[Axis::X] * accel_[Axis::Z],
+                    tgt_pose_[Axis::Z] * accel_[Axis::Z] +
+                      tgt_pose_[Axis::X] * accel_[Axis::X]),
+        -std::atan2(tgt_pose_[Axis::X] * accel_[Axis::Y] -
+                      tgt_pose_[Axis::Y] * accel_[Axis::X],
+                    tgt_pose_[Axis::X] * accel_[Axis::X] +
+                      tgt_pose_[Axis::Y] * accel_[Axis::Y])};
+
+      for (int i = 0; i < AXIS_NUM; i++) {
+        ang_diff_[i] = CalculateAngularDifference(prev_ang_diff_[i],
+                                                  ang_diff_accel[i], gyro_[i]);
+        prev_ang_diff_[i] = ang_diff_[i];
+        mot_ang_vel_[i] = GetMotorAngularVelocity(motors_[i].ReadEncoder());
       }
     } else {
       state_ = State::Idle;
@@ -189,8 +218,14 @@ void loop() {
 
     // Calculate motor torque
     switch (state_) {
-      case State::BalancingOnEdge:
-        BalanceOnEdge();
+      case State::BalancingOnEdgeX:
+        BalanceOnEdge(Axis::X);
+        break;
+      case State::BalancingOnEdgeY:
+        BalanceOnEdge(Axis::Y);
+        break;
+      case State::BalancingOnEdgeZ:
+        BalanceOnEdge(Axis::Z);
         break;
       case State::Idle:
       default:
@@ -233,39 +268,21 @@ void Idle() {
   }
 }
 
-void BalanceOnEdge() {
-  std::array<float, AXIS_NUM> tmp_torque = {
-    constrain(
-      -kp_[Axis::X] *
-          (ang_diff_[Axis::X] - kp2_[Axis::X] * est_ang_ofst_[Axis::X]) -
-        kd_[Axis::X] * gyro_[Axis::X] - kw_[Axis::X] * mot_ang_vel_[Axis::X],
-      -Motor::MAX_TORQUE, Motor::MAX_TORQUE),
-    constrain(
-      -kp_[Axis::Y] *
-          (ang_diff_[Axis::Y] - kp2_[Axis::Y] * est_ang_ofst_[Axis::Y]) -
-        kd_[Axis::Y] * gyro_[Axis::Y] - kw_[Axis::Y] * mot_ang_vel_[Axis::Y],
-      -Motor::MAX_TORQUE, Motor::MAX_TORQUE),
-    constrain(
-      kp_[Axis::Z] *
-          (ang_diff_[Axis::Z] - kp2_[Axis::Z] * est_ang_ofst_[Axis::Z]) +
-        kd_[Axis::Z] * gyro_[Axis::Z] + kw_[Axis::Z] * mot_ang_vel_[Axis::Z],
-      -Motor::MAX_TORQUE, Motor::MAX_TORQUE)};
+void BalanceOnEdge(Axis axis) {
+  // Update torque
+  torque_ = std::array<int, 3>{0, 0, 0};
+  torque_[axis] = constrain(
+    -kp_[axis] * (ang_diff_[axis] - kp2_[axis] * est_ang_ofst_[axis]) -
+      kd_[axis] * gyro_[axis] - kw_[axis] * mot_ang_vel_[axis],
+    -Motor::MAX_TORQUE, Motor::MAX_TORQUE);
 
-  static const float ALPHA_TORQUE = 1.0;
-  torque_[Axis::X] = static_cast<int>((1.0 - ALPHA_TORQUE) * torque_[Axis::X] +
-                                      ALPHA_TORQUE * tmp_torque[Axis::X]);
-  torque_[Axis::Y] = 0;
-  torque_[Axis::Z] = 0;
-  // torque_.y = (1.0 - ALPHA_TORQUE) * torque_.y + ALPHA_TORQUE * tmp_torque.y;
-  // torque_.z = (1.0 - ALPHA_TORQUE) * torque_.z + ALPHA_TORQUE * tmp_torque.z;
-
+  // Update angle offset
   static const float ALPHA_OFST = 0.000001;
-  est_ang_ofst_[Axis::X] =
-    constrain((1.0 - ALPHA_OFST) * est_ang_ofst_[Axis::X] +
-                ALPHA_OFST * mot_ang_vel_[Axis::X],
-              -10.0 * DEG_TO_RAD, 10.0 * DEG_TO_RAD);
-  est_ang_ofst_[Axis::Y] = 0.0;
-  est_ang_ofst_[Axis::Z] = 0.0;
+  Vector3 tmp_est_ang_ofst = {0.0, 0.0, 0.0};
+  tmp_est_ang_ofst[axis] = constrain(
+    (1.0 - ALPHA_OFST) * est_ang_ofst_[axis] + ALPHA_OFST * mot_ang_vel_[axis],
+    -10.0 * DEG_TO_RAD, 10.0 * DEG_TO_RAD);
+  est_ang_ofst_ = tmp_est_ang_ofst;
 }
 
 void UpdateFeedbackGain() {
@@ -275,8 +292,7 @@ void UpdateFeedbackGain() {
      * @param k_array Gain array
      * @param val Value to add
      */
-    auto add_values_to_all = [](std::array<float, AXIS_NUM>& k_array,
-                                float val) {
+    auto add_values_to_all = [](Vector3& k_array, float val) {
       // for (auto k : k_array) {
       //   k += val;
       // }
@@ -327,15 +343,21 @@ void UpdateFeedbackGain() {
 }
 
 void PlotWithTeleplot() {
-  // Serial.println(">accel_.x:" + String(accel_.x));
-  // Serial.println(">accel_.y:" + String(accel_.y));
-  // Serial.println(">accel_.z:" + String(accel_.z));
+  // Serial.println(">accel_[X]:" + String(accel_[Axis::X]));
+  // Serial.println(">accel_[Y]:" + String(accel_[Axis::Y]));
+  // Serial.println(">accel_[Z]:" + String(accel_[Axis::Z]));
   Serial.println(">ang_diff_x:" + String(ang_diff_[Axis::X] * RAD_TO_DEG));
   // Serial.println(">ang_diff_y:" + String(ang_diff_y_ * RAD_TO_DEG));
   // Serial.println(">ang_diff_z:" + String(ang_diff_z_ * RAD_TO_DEG));
   Serial.println(">mot_ang_vel:" + String(mot_ang_vel_[Axis::X]));
   Serial.println(">gyro:" + String(gyro_[Axis::X]));
   Serial.println(">torque:" + String(torque_[Axis::X]));
-  Serial.println(">est_ang_ofst:" +
-                 String(est_ang_ofst_[Axis::X] * RAD_TO_DEG));
+  // Serial.println(">est_ang_ofst:" +
+  //                String(est_ang_ofst_[Axis::X] * RAD_TO_DEG));
+  // Serial.println(">ang_pose_x:" +
+  //                String(GetAngle(accel_, TGT_POSE_X) * RAD_TO_DEG));
+  // Serial.println(">ang_pose_y:" +
+  //                String(GetAngle(accel_, TGT_POSE_Y) * RAD_TO_DEG));
+  // Serial.println(">ang_pose_z:" +
+  //                String(GetAngle(accel_, TGT_POSE_Z) * RAD_TO_DEG));
 }
